@@ -177,3 +177,7 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+IsaacLab-Arena/
+pi0.6star.pdf
+pi06/
