@@ -80,6 +80,13 @@ class PI06StarConfig(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    use_advantage_conditioning: bool = False  # Enable advantage conditioning for ReCAP
+    
+    # Value function parameters (for ReCAP)
+    use_value_function: bool = False
+    value_hidden_dim: int = 1024
+    num_bins: int = 201
+    max_task_length: int = 500
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -106,10 +113,10 @@ class PI06StarConfig(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
 
-        if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
+        if self.paligemma_variant not in ["gemma_300m", "gemma_2b", "gemma_670m"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
 
-        if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
+        if self.action_expert_variant not in ["gemma_300m", "gemma_2b", "dummy"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
 
         if self.dtype not in ["bfloat16", "float32"]:
@@ -132,7 +139,7 @@ class PI06StarConfig(PreTrainedConfig):
             )
             self.input_features[OBS_STATE] = state_feature
 
-        if ACTION not in self.output_features:
+        if not self.use_value_function and ACTION not in self.output_features:
             action_feature = PolicyFeature(
                 type=FeatureType.ACTION,
                 shape=(self.max_action_dim,),  # Padded to max_action_dim

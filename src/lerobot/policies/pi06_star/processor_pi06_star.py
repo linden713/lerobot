@@ -76,11 +76,25 @@ class Pi06StarPrepareStateTokenizerProcessorStep(ProcessorStep):
         state_np = state.cpu().numpy()
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
+        # Helper to get advantage conditioning from complementary data if available
+        advantage_statuses = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get("advantage_status")
+
         full_prompts = []
         for i, task in enumerate(tasks):
             cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
             state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            
+            # ReCAP Advantage Conditioning
+            advantage_str = ""
+            if advantage_statuses is not None and i < len(advantage_statuses):
+                status = advantage_statuses[i]
+                if status: # True/Positive
+                     advantage_str = "Advantage: positive "
+                else:
+                     advantage_str = "Advantage: negative "
+            
+            # Matches format Task: ..., State: ...; Advantage: ...\nAction: 
+            full_prompt = f"Task: {cleaned_text}, State: {state_str}; {advantage_str}\nAction: "
             full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
@@ -97,9 +111,66 @@ class Pi06StarPrepareStateTokenizerProcessorStep(ProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register(name="pi06_star_value_target_processor_step")
+@dataclass
+class Pi06StarValueTargetProcessorStep(ProcessorStep):
+    """
+    Computes value target (time to completion) and adds it to the batch.
+    """
+    max_task_length: int = 500
+    dataset_meta: Any = None # LeRobotDatasetMetadata
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        
+        comp_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+        
+        if "episode_index" in comp_data and "frame_index" in comp_data:
+            ep_idx = comp_data["episode_index"]
+            frame_idx = comp_data["frame_index"]
+            
+            if self.dataset_meta is not None:
+                if "is_episode_successful" not in self.dataset_meta.episodes:
+                    raise ValueError(
+                        f"Dataset '{self.dataset_meta.repo_id}' metadata is missing 'is_episode_successful' field. "
+                        "This field is required for PI06Star Value Function training to determine success/failure."
+                    )
+
+                try:
+                    # In LeRobotDatasetMetadata, episodes is a dict containing 'length' key which is a list/array
+                    total_steps = self.dataset_meta.episodes["length"][int(ep_idx)]
+                    is_success = self.dataset_meta.episodes["is_episode_successful"][int(ep_idx)]
+                except (KeyError, IndexError):
+                    total_steps = self.max_task_length # Fallback
+                    is_success = False
+
+                current_step = int(frame_idx)
+                
+                c_fail = 0.0 if bool(is_success) else 2.0 * self.max_task_length
+                
+                steps_remaining = total_steps - current_step
+                raw_value = -steps_remaining - c_fail
+                norm_value = raw_value / self.max_task_length
+                target_value = max(norm_value, -1.0)
+                
+                # Bins
+                target_bin = int((target_value + 1.0) * 200)
+                target_bin = max(0, min(200, target_bin))
+                
+                transition[TransitionKey.COMPLEMENTARY_DATA]["value_target"] = torch.tensor(target_bin, dtype=torch.long)
+
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 def make_pi06_star_pre_post_processors(
     config: PI06StarConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset_meta: Any = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -148,8 +219,17 @@ def make_pi06_star_pre_post_processors(
             padding_side="right",
             padding="max_length",
         ),
-        DeviceProcessorStep(device=config.device),
     ]
+
+    if config.use_value_function:
+        input_steps.append(
+            Pi06StarValueTargetProcessorStep(
+                max_task_length=config.max_task_length,
+                dataset_meta=dataset_meta
+            )
+        )
+
+    input_steps.append(DeviceProcessorStep(device=config.device))
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(

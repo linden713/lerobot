@@ -89,11 +89,26 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+
+        episodes = cfg.dataset.episodes
+        if isinstance(episodes, str) and episodes.startswith("slice("):
+            # Safe eval to convert "slice(0, 500)" string to slice object
+            try:
+                # Restrict globals/locals for safety
+                episodes = eval(episodes, {"__builtins__": None}, {"slice": slice})
+            except Exception as e:
+                raise ValueError(f"Could not parse episodes slice string: {episodes}") from e
+        
+        # If episodes is a slice, convert to list of indices
+        if isinstance(episodes, slice):
+            start, stop, step = episodes.indices(ds_meta.total_episodes)
+            episodes = list(range(start, stop, step))
+
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
+                episodes=episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
@@ -104,7 +119,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
+                episodes=episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,

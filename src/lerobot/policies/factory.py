@@ -45,6 +45,7 @@ from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
+from lerobot.policies.pi06_star.configuration_pi06_star import PI06StarConfig
 from lerobot.processor.converters import (
     batch_to_transition,
     policy_action_to_transition,
@@ -181,6 +182,9 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
+    elif policy_type == "pi06_star_value":
+        from lerobot.policies.pi06_star.configuration_pi06_star_value import PI06StarValueConfig
+        return PI06StarValueConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)

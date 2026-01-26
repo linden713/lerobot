@@ -1,0 +1,91 @@
+ReCAP (Pi0.6 Star) 架构与参数设置依据详解
+==================================================
+
+本文档详细解释了 Pi0.6 Star (ReCAP) 实现中的关键架构选择和参数设置，并引用了原始论文《π0.6: a VLA That Learns From Experience》作为依据。
+
+1. Value Function (价值函数) 架构
+---------------------------------
+
+### 设置：使用 ~670M 参数的 VLM Backbone
+我们的实现 (`PI06StarValueFunction`) 使用了 `gemma_670m` 变体，而不是 Pi0.6 Policy 使用的 4B 或 860M 模型。
+
+**论文依据 (Section V-C):**
+> "The value function takes as input the same language inputs as the π0.6∗ VLA, and uses the same architecture design, with a **smaller 670M parameter VLM backbone** that is also initialized from Gemma 3 (see Figure 3)."
+>
+> *译文：价值函数接受与 π0.6* VLA 相同的语言输入，并使用相同的架构设计，但使用**较小的 670M 参数 VLM 主干**，该主干也从 Gemma 3 初始化。*
+
+**原因：**
+使用较小的模型可以在训练 VLA 时进行“即时 (on-the-fly)”推理，而不会带来过大的计算开销 (Section V-D: "on-the-fly inference of the value function incurs minimal additional cost")。
+
+2. 分布式价值函数 (Distributional Value Function)
+-------------------------------------------------
+
+### 设置：201 个离散 Bins
+我们将价值函数的输出设计为 201 个分类 logits (`NUM_VALUE_BINS = 201`)。
+
+**论文依据 (Equation 1 & Section V-A):**
+> "...discretizing the empirical return value Rt(τ) into **B = 201 bins** (using RtB to denote the discretized returns), and then minimizing the cross-entropy H..."
+>
+> *译文：...将经验回报值 Rt(τ) 离散化为 **B = 201 个区间**，然后最小化交叉熵 H...*
+
+**原因：**
+分布式强化学习 (Distributional RL) 通常比预测单一标量值更稳定，能够捕捉不确定性。论文明确指出预测的是通过最大任务长度归一化后的“剩余步数的负值” (negative number of steps)。
+
+### 设置：归一化范围 (-1, 0)
+预测的目标值并非绝对步数，而是归一化后的值。
+
+**论文依据 (Section V-C & Equation 5):**
+> "We derive the reward from this episode-level success label such that the value function corresponds to the (negative) number of steps until successful completion... This is equivalent to:
+> rt = 0 (if t=T and success)
+> rt = -C_fail (if t=T and failure)
+> rt = -1 (otherwise)"
+>
+> "In practice, we normalize the values predicted to be between **(−1, 0)**."
+
+**原因：**
+这种稀疏奖励的设计使得价值函数能够直接反映“距离成功的远近”。
+*   对于**成功**的回合，累积回报 $R_t$ 就是剩余步数的负值。归一化后，0 标识已成功，-1 标识尚早。
+*   对于**失败**的回合，由于常数 $C_{fail}$ 的存在，回报会非常小，在归一化并离散化后，这些状态会落入代表“低价值”的 Bin 0 中。
+*   通过这种方式，模型不仅能识别哪些动作是通往成功的，还能识别哪些动作会导致必然的失败。
+
+3. 优势条件化 (Advantage Conditioning)
+--------------------------------------
+
+### 设置：Text Prompt 注入 "Advantage: positive/negative"
+我们在 `processor_pi06_star.py` 中修改了 prompt 构建逻辑，根据优势值注入特定的文本字符串。
+
+**论文依据 (Section V-B):**
+> "To incorporate information about the advantage into the policy, we expand the model inputs to contain an additional improvement indicator as an additional text input, inputting **“Advantage: positive” when It = True, and “Advantage: negative” otherwise**."
+>
+> *译文：为了将优势信息融入策略，我们扩展模型输入以包含额外的改进指示符作为附加文本输入，当 It = True 时输入 **“Advantage: positive”**，否则输入 **“Advantage: negative”**。*
+
+**原因：**
+这是 ReCAP 的核心机制。与其使用复杂的策略梯度更新 (如 PPO)，ReCAP 采用简单的监督学习 (SFT)，但通过条件化 (Conditioning) 区分“好”行为和“坏”行为。在推理时，我们只需强制输入 "Advantage: positive" 即可诱导模型生成高优势的动作。
+
+4. 改进指示符阈值 (Improvement Threshold)
+-----------------------------------------
+
+### 设置：基于 30% 分位数的阈值
+虽然代码中目前通过外部传入 `advantage_status`，但在计算该状态时，依据是 30% 分位数。
+
+**论文依据 (Section V-D):**
+> "We set ϵl to the **30% percentile** of values predicted by the value function for the task l."
+>
+> *译文：我们将 ϵl 设置为价值函数对任务 l 预测值的 **30% 分位数**。*
+
+**原因：**
+这决定了哪些轨迹被认为是“正向优势”。30% 的阈值意味着不仅是最好的轨迹，稍好于平均水平的轨迹也被用来提供正向信号，这提供了足够的数据量用于训练。
+
+5. 策略架构 (Policy Architecture)
+---------------------------------
+
+### 设置：Flow Matching + Discrete Tokens
+我们的策略实现保持了 Pi0.6 的原有架构，即同时包含用于高层规划的离散 Token 预测和用于底层的 Flow Matching 动作生成。
+
+**论文依据 (Section V-A):**
+> "The model also produces tokenized discrete outputs ℓˆ ... Since the actions are generated after ℓˆ, action generation is effectively conditioned on this predicted sub-task... discrete and continuous actions are predicted independently."
+>
+> *译文：模型还会生成离散的 token 输出 ℓˆ ... 由于动作是在 ℓˆ 之后生成的，动作生成实际上是以预测的子任务为条件的 ... 离散和连续动作是独立预测的。*
+
+**原因：**
+ReCAP 是基于 Pi0.6 架构构建的。Advantage indicator 被作为 input text 插入，因此它同时影响随后的离散 token 预测 (子任务) 和连续动作生成 (Flow Matching)，从而在所有层面上引导策略向更优方向发展。

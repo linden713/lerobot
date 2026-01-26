@@ -321,6 +321,16 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
             num_kv_heads=1,
             head_dim=256,
         )
+    # TODO: gemma_670m
+    elif variant == "gemma_670m":
+        return GemmaConfig(
+            width=1024,
+            depth=18,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -550,18 +560,28 @@ class PI06StarPytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
-            use_adarms=[False, True],
+            use_adarms=[False, False] if config.use_value_function else [False, True],
             precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
         )
 
-        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        if config.use_value_function:
+            # Value Function Head (2-layer MLP)
+            self.value_head = nn.Sequential(
+                nn.Linear(paligemma_config.width, config.value_hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.value_hidden_dim, config.value_hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.value_hidden_dim, config.num_bins),
+            )
+        else:
+            self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
+            self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
-        self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
-        self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
+            self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -569,9 +589,9 @@ class PI06StarPytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
-            # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+            if not config.use_value_function:
+                 self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
 
         msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
 
@@ -630,6 +650,38 @@ class PI06StarPytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
+
+    def forward_value(self, images, img_masks, tokens, masks) -> tuple[Tensor, dict]:
+        """Forward pass for Value Function."""
+        # 1. Embed Inputs (Prefix)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        
+        # 2. Construct Masks for VLM
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        
+        # 3. Run VLM Encoder (Prefix Only)
+        # We only need the prefix output from the VLM part of the model
+        (prefix_output, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            inputs_embeds=[prefix_embs, None], # suffix is None for value function!
+            use_cache=False,
+            # adarms_cond is handled internally or defaults to None
+        )
+        
+        # 4. Pooling (Last Token)
+        # We use the embedding of the last token to predict the value
+        sequence_lengths = prefix_pad_masks.sum(dim=1) - 1
+        bsize = prefix_output.shape[0]
+        last_token_indices = sequence_lengths.long().unsqueeze(-1).unsqueeze(-1).expand(bsize, 1, prefix_output.size(-1))
+        pooled_output = torch.gather(prefix_output, 1, last_token_indices).squeeze(1)
+        
+        # 5. Value Head Prediction
+        logits = self.value_head(pooled_output) # [B, num_bins]
+        
+        return logits
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
@@ -1247,29 +1299,50 @@ class PI06StarPolicy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions = self.prepare_action(batch)
-
-        # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
-
-        # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
-
-        loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-        }
-
-        if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
-        else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
+        if self.config.use_value_function:
+            # Value Function Training Branch
+            logits = self.model.forward_value(images, img_masks, tokens, masks)
+            
+            loss_dict = {}
+            loss = torch.tensor(0.0, device=logits.device)
+            
+            if "value_target" in batch:
+                loss = F.cross_entropy(logits, batch["value_target"])
+                loss_dict["loss"] = loss.item()
+                
+                # Add classification accuracy for monitoring
+                with torch.no_grad():
+                    preds = torch.argmax(logits, dim=-1)
+                    acc = (preds == batch["value_target"]).float().mean()
+                    loss_dict["accuracy"] = acc.item()
+            
             return loss, loss_dict
+        
+        else:
+            # Standard Diffusion Training Branch
+            actions = self.prepare_action(batch)
+
+            # Compute loss (no separate state needed for PI05)
+            losses = self.model.forward(images, img_masks, tokens, masks, actions)
+
+            # Truncate losses to actual action dimensions
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            losses = losses[:, :, :original_action_dim]
+
+            loss_dict = {
+                "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            }
+
+            if reduction == "none":
+                # Return per-sample losses (B,) by averaging over time and action dims
+                per_sample_loss = losses.mean(dim=(1, 2))
+                loss_dict["loss"] = per_sample_loss.mean().item()
+                return per_sample_loss, loss_dict
+            else:
+                # Default: return scalar mean loss
+                loss = losses.mean()
+                loss_dict["loss"] = loss.item()
+                return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""

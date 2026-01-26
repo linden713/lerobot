@@ -38,4 +38,5 @@ __all__ = [
     "GrootConfig",
     "XVLAConfig",
     "WallXConfig",
+    "PI06StarValueConfig",
 ]
