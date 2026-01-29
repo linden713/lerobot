@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature, FeatureType
 from lerobot.policies.pi06_star.configuration_pi06_star import PI06StarConfig
 from lerobot.policies.pi06_star.modeling_pi06_star import pad_vector
 from lerobot.processor import (
@@ -85,13 +85,18 @@ class Pi06StarPrepareStateTokenizerProcessorStep(ProcessorStep):
             state_str = " ".join(map(str, discretized_states[i]))
             
             # ReCAP Advantage Conditioning
-            advantage_str = ""
-            if advantage_statuses is not None and i < len(advantage_statuses):
+            if advantage_statuses is None:
+                # Inference time default: assume positive advantage (success)
+                advantage_str = "Advantage: positive "
+            elif i < len(advantage_statuses):
                 status = advantage_statuses[i]
                 if status: # True/Positive
                      advantage_str = "Advantage: positive "
                 else:
                      advantage_str = "Advantage: negative "
+            else:
+                # Fallback if status list is shorter than task list (shouldn't happen)
+                advantage_str = "Advantage: positive "
             
             # Matches format Task: ..., State: ...; Advantage: ...\nAction: 
             full_prompt = f"Task: {cleaned_text}, State: {state_str}; {advantage_str}\nAction: "
@@ -120,50 +125,202 @@ class Pi06StarValueTargetProcessorStep(ProcessorStep):
     max_task_length: int = 500
     dataset_meta: Any = None # LeRobotDatasetMetadata
 
+    episode_lengths: torch.Tensor | None = None
+    episode_success: torch.Tensor | None = None
+    episode_partial_success: torch.Tensor | None = None
+
+    def __post_init__(self):
+        if self.dataset_meta is None:
+             return
+
+        # Helper to access columns from either dict or HF Dataset
+        episodes = self.dataset_meta.episodes
+        # HF Dataset has column_names, dict has keys()
+        available_keys = getattr(episodes, "column_names", None)
+        if available_keys is None:
+            available_keys = episodes.keys()
+        
+        available_keys = set(available_keys) # fast lookup
+
+        if "length" not in available_keys:
+            return  # Fallback to runtime error if lengths needed but missing
+
+        # Load standard columns
+        # Note: HF Dataset access by string returns a list/column, same as dict
+        self.episode_lengths = torch.tensor(episodes["length"], dtype=torch.long)
+        
+        if "is_episode_successful" in available_keys:
+            self.episode_success = torch.tensor(episodes["is_episode_successful"], dtype=torch.bool)
+        else:
+            self.episode_success = torch.zeros(len(self.episode_lengths), dtype=torch.bool)
+        
+        if "partial_success" in available_keys:
+            self.episode_partial_success = torch.tensor(episodes["partial_success"], dtype=torch.float32)
+        else:
+            self.episode_partial_success = torch.zeros(len(self.episode_lengths), dtype=torch.float32)
+
+        # Determine Task IDs for aggregation (unify task_index and tasks logic)
+        task_ids = None
+        if "task_index" in available_keys and episodes["task_index"] is not None:
+            # Assuming task_index is a list or tensor of ints
+            task_ids = [int(x) for x in episodes["task_index"]]
+        elif "tasks" in available_keys:
+            # tasks is usually list of lists of strings (e.g. [['task_desc'], ...])
+            # We use the first task string as identifier
+            tasks_col = episodes["tasks"]
+            task_ids = []
+            for t in tasks_col:
+                if isinstance(t, list) and len(t) > 0:
+                    task_ids.append(t[0])
+                else:
+                    task_ids.append(str(t))
+
+        if task_ids is None:
+             raise ValueError("Neither 'task_index' nor 'tasks' found in dataset metadata, required for Pi06Star.")
+
+        # Compute Max Lengths per Task
+        task_max_map = {}
+        input_lengths = self.episode_lengths.tolist()
+        
+        for t_id, length in zip(task_ids, input_lengths):
+            current_max = task_max_map.get(t_id, 0)
+            if length > current_max:
+                task_max_map[t_id] = length
+        
+        # Map back to per-episode max length
+        self.episode_task_max_lengths = torch.tensor(
+            [task_max_map[t_id] for t_id in task_ids], 
+            dtype=torch.float32
+        )
+
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        transition = transition.copy()
+        """
+        Compute value targets (return-to-go) and add to batch.
+        """
+        if self.episode_lengths is None:
+             raise ValueError("Dataset metadata (episode_lengths) is required for Pi06StarValueTargetProcessorStep.")
+
+        # The batch (transition) contains 'info' and 'complementary_data' dictionaries
+        # We need to extract episode_index and frame_index from there.
         
-        comp_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+        ep_indices = None
+        frame_indices = None
         
-        if "episode_index" in comp_data and "frame_index" in comp_data:
-            ep_idx = comp_data["episode_index"]
-            frame_idx = comp_data["frame_index"]
+        # Helper to look in nested dict
+        def get_tensor(src, key):
+            if key in src:
+                val = src[key]
+                if not isinstance(val, torch.Tensor):
+                    return torch.tensor(val)
+                return val
+            return None
+
+        # Check in 'info'
+        info = transition.get("info", {})
+        if "episode_index" in info:
+            ep_indices = get_tensor(info, "episode_index")
+        if "index" in info:
+            frame_indices = get_tensor(info, "index")
+        elif "frame_index" in info: # sometimes called frame_index
+            frame_indices = get_tensor(info, "frame_index")
+
+        # Check in 'complementary_data' if not found
+        if ep_indices is None or frame_indices is None:
+            comp = transition.get("complementary_data", {})
+            if ep_indices is None and "episode_index" in comp:
+                ep_indices = get_tensor(comp, "episode_index")
+            if frame_indices is None:
+                if "index" in comp:
+                    frame_indices = get_tensor(comp, "index")
+                elif "frame_index" in comp:
+                    frame_indices = get_tensor(comp, "frame_index")
+
+        if ep_indices is None or frame_indices is None:
+             raise ValueError(f"Missing 'episode_index' or 'index' in batch info/complementary_data.")
+
+        # Ensure they are tensors (handle batching)
+        if not isinstance(ep_indices, torch.Tensor):
+            ep_indices = torch.tensor(ep_indices)
+        if not isinstance(frame_indices, torch.Tensor):
+            frame_indices = torch.tensor(frame_indices)
+            ep_indices = torch.tensor(ep_indices)
+        if not isinstance(frame_indices, torch.Tensor):
+            frame_indices = torch.tensor(frame_indices)
             
-            if self.dataset_meta is not None:
-                if "is_episode_successful" not in self.dataset_meta.episodes:
-                    raise ValueError(
-                        f"Dataset '{self.dataset_meta.repo_id}' metadata is missing 'is_episode_successful' field. "
-                        "This field is required for PI06Star Value Function training to determine success/failure."
-                    )
+        # Handle singleton batch or scalar
+        if ep_indices.ndim == 0:
+            ep_indices = ep_indices.unsqueeze(0)
+        if frame_indices.ndim == 0:
+            frame_indices = frame_indices.unsqueeze(0)
 
-                try:
-                    # In LeRobotDatasetMetadata, episodes is a dict containing 'length' key which is a list/array
-                    total_steps = self.dataset_meta.episodes["length"][int(ep_idx)]
-                    is_success = self.dataset_meta.episodes["is_episode_successful"][int(ep_idx)]
-                except (KeyError, IndexError):
-                    total_steps = self.max_task_length # Fallback
-                    is_success = False
+        batch_size = ep_indices.shape[0]
+        # print(f"DEBUG: Found indices. Batch size: {batch_size}", flush=True)
+        target_bins = []
 
-                current_step = int(frame_idx)
-                
-                c_fail = 0.0 if bool(is_success) else 2.0 * self.max_task_length
-                
-                steps_remaining = total_steps - current_step
-                raw_value = -steps_remaining - c_fail
-                norm_value = raw_value / self.max_task_length
-                target_value = max(norm_value, -1.0)
-                
-                # Bins
-                target_bin = int((target_value + 1.0) * 200)
-                target_bin = max(0, min(200, target_bin))
-                
-                transition[TransitionKey.COMPLEMENTARY_DATA]["value_target"] = torch.tensor(target_bin, dtype=torch.long)
+        # Vectorized lookup if metadata is available
+        if self.episode_lengths is not None:
+            # ep_indices might be on GPU or CPU, move to CPU for indexing cached CPU tensors
+            # Ensure indices are long for indexing
+            cpu_ep_indices = ep_indices.cpu().long()
+            cpu_frame_indices = frame_indices.cpu().long()
+            
+            # Clamp in case indexes are out of bounds (shouldn't happen)
+            cpu_ep_indices = torch.clamp(cpu_ep_indices, 0, len(self.episode_lengths) - 1)
 
-        return transition
+            total_steps = self.episode_lengths[cpu_ep_indices]
+            is_success_batch = self.episode_success[cpu_ep_indices]
+            partial_success_batch = self.episode_partial_success[cpu_ep_indices]
+            
+            # Proceed with vectorized calculation (much faster than loop)
+            current_steps = cpu_frame_indices
+            
+            # Calculate c_fails:
+            # If Success: 0.0
+            # If Failure: (1.0 - partial_success) * max_task_length
+            # Note: We use 1.0 * max_len (instead of 2.0) to map partial=0 -> c_fail=max_len -> Value=-1
+            # If partial=0.5 -> c_fail=0.5*max_len -> Value=-0.5
+            
+            # Use pre-computed task max lengths for this batch
+            batch_max_lens = self.episode_task_max_lengths[cpu_ep_indices]
+            
+            c_fails = torch.where(
+                is_success_batch, 
+                torch.tensor(0.0), 
+                (1.0 - partial_success_batch) * batch_max_lens
+            )
+            
+            steps_remaining = total_steps - current_steps
+            raw_values = -steps_remaining.float() - c_fails
+            norm_values = raw_values / batch_max_lens
+            target_values = torch.maximum(norm_values, torch.tensor(-1.0))
+            
+            # Bins
+            target_bins_tensor = ((target_values + 1.0) * 200).long()
+            target_bins_tensor = torch.clamp(target_bins_tensor, 0, 200)
+            
+            # To ensure compatibility with pipeline, we can keep it as tensor on correct device
+            target_bins_tensor = target_bins_tensor.to(device=ep_indices.device)
+            
+            # Assign directly
+            if TransitionKey.OBSERVATION not in transition:
+                 transition[TransitionKey.OBSERVATION] = {}
+            transition[TransitionKey.OBSERVATION]["value_target"] = target_bins_tensor
+            
+            return transition
+
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        # Register value_target as an observation feature so it passes through the pipeline
+        if PipelineFeatureType.OBSERVATION not in features:
+            features[PipelineFeatureType.OBSERVATION] = {}
+            
+        features[PipelineFeatureType.OBSERVATION]["value_target"] = PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(1,), # Scalar
+        )
         return features
 
 

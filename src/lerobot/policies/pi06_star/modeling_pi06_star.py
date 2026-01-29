@@ -343,7 +343,7 @@ class PaliGemmaWithExpertModel(
     def __init__(
         self,
         vlm_config,
-        action_expert_config,
+        action_expert_config=None,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
         image_size: int = DEFAULT_IMAGE_SIZE,
@@ -372,27 +372,30 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
         vlm_config_hf.vision_config.image_size = image_size
         vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
+        vlm_config_hf.vision_config.projection_dim = vlm_config.width
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
-        action_expert_config_hf = CONFIG_MAPPING["gemma"](
-            head_dim=action_expert_config.head_dim,
-            hidden_size=action_expert_config.width,
-            intermediate_size=action_expert_config.mlp_dim,
-            num_attention_heads=action_expert_config.num_heads,
-            num_hidden_layers=action_expert_config.depth,
-            num_key_value_heads=action_expert_config.num_kv_heads,
-            vocab_size=257152,
-            hidden_activation="gelu_pytorch_tanh",
-            torch_dtype="float32",
-            use_adarms=use_adarms[1],
-            adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
-        )
-
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        self.gemma_expert.model.embed_tokens = None
+
+        if action_expert_config is not None:
+            action_expert_config_hf = CONFIG_MAPPING["gemma"](
+                head_dim=action_expert_config.head_dim,
+                hidden_size=action_expert_config.width,
+                intermediate_size=action_expert_config.mlp_dim,
+                num_attention_heads=action_expert_config.num_heads,
+                num_hidden_layers=action_expert_config.depth,
+                num_key_value_heads=action_expert_config.num_kv_heads,
+                vocab_size=257152,
+                hidden_activation="gelu_pytorch_tanh",
+                torch_dtype="float32",
+                use_adarms=use_adarms[1],
+                adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            )
+            self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+            self.gemma_expert.model.embed_tokens = None
+        else:
+            self.gemma_expert = None
 
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
@@ -559,7 +562,7 @@ class PI06StarPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
-            action_expert_config,
+            action_expert_config=None if config.use_value_function else action_expert_config,
             use_adarms=[False, False] if config.use_value_function else [False, True],
             precision=config.dtype,
             image_size=config.image_resolution[0],
@@ -608,7 +611,8 @@ class PI06StarPytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.gradient_checkpointing_enabled = True
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        if self.paligemma_with_expert.gemma_expert:
+            self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
 
     def gradient_checkpointing_disable(self):
@@ -616,7 +620,8 @@ class PI06StarPytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.gradient_checkpointing_enabled = False
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        if self.paligemma_with_expert.gemma_expert:
+            self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
     def _rtc_enabled(self):

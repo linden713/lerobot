@@ -179,5 +179,7 @@ outputs/
 *.part
 
 IsaacLab-Arena/
-pi0.6star.pdf
+# pi0.6star.pdf
 pi06/
+
+roboarena_converted/

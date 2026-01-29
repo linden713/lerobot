@@ -395,6 +395,15 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, PI06StarConfig):
+        from lerobot.policies.pi06_star.processor_pi06_star import make_pi06_star_pre_post_processors
+        
+        processors = make_pi06_star_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+            dataset_meta=kwargs.get("dataset_meta"),
+        )
+
     else:
         try:
             processors = _make_processors_from_policy_config(
@@ -570,6 +579,7 @@ def _get_policy_cls_from_policy_name(name: str) -> type[PreTrainedConfig]:
 def _make_processors_from_policy_config(
     config: PreTrainedConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    **kwargs,
 ) -> tuple[Any, Any]:
     """Create pre- and post-processors from a policy configuration using dynamic imports.
 
@@ -578,6 +588,7 @@ def _make_processors_from_policy_config(
     Args:
         config: The policy configuration object.
         dataset_stats: Dataset statistics for normalization.
+        **kwargs: Additional arguments to pass to the processor factory.
     Returns:
         A tuple containing the input (pre-processor) and output (post-processor) pipelines.
     """
@@ -592,4 +603,4 @@ def _make_processors_from_policy_config(
     )
     module = importlib.import_module(module_path)
     function = getattr(module, function_name)
-    return function(config, dataset_stats=dataset_stats)
+    return function(config, dataset_stats=dataset_stats, **kwargs)

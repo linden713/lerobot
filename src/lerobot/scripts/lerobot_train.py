@@ -254,7 +254,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
     # For SARM, always provide dataset_meta for progress normalization
-    if cfg.policy.type == "sarm":
+    # For SARM, always provide dataset_meta for progress normalization
+    if cfg.policy.type in ["sarm", "pi06_star"]:
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
@@ -358,7 +359,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
+        persistent_workers=cfg.num_workers > 0,
     )
 
     # Prepare everything with accelerator
